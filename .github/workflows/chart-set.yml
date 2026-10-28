@@ -1,0 +1,77 @@
+# Builds a chart set each week and publishes it as a release; files unchanged since an earlier set are not
+# uploaded again (chartset/build_set.py). The devices read the latest release's set.tsv.
+name: Chart set
+
+on:
+  schedule:
+    - cron: "30 9 * * 5"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["chartset/**", "tests/**", ".github/workflows/chart-set.yml"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: chart-set
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r chartset/requirements.txt
+      - run: python tests/test_grid_file.py
+
+  build:
+    needs: test
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r chartset/requirements.txt
+      - name: Build the set
+        id: set
+        run: |
+          set +e
+          python chartset/build_set.py --work work --out out --workers 4 \
+            --previous "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/set.tsv"
+          code=$?
+          set -e
+          if [ "$code" = 3 ]; then echo "changed=no" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ "$code" != 0 ]; then exit "$code"; fi
+          echo "changed=yes" >> "$GITHUB_OUTPUT"
+          echo "tag=$(awk -F'\t' '$1=="# set"{print $2}' out/set.tsv)" >> "$GITHUB_OUTPUT"
+      - name: Publish the set
+        if: steps.set.outputs.changed == 'yes'
+        run: |
+          tag="${{ steps.set.outputs.tag }}"
+          notes="NOAA charts and depth grids, Penobscot Bay to Narragansett Bay. Not for navigation: NOAA's grids are a test product. set.tsv lists every file of the set and the release that holds it."
+          # Companion releases first, then the set's own release with set.tsv, made latest last, so
+          # releases/latest never names a set whose files are not all there.
+          for list in out/upload-*.txt; do
+            [ -e "$list" ] || continue
+            rel="$(basename "$list" .txt)"; rel="${rel#upload-}"
+            [ "$rel" = "$tag" ] && continue
+            gh release create "$rel" --draft --title "$rel" --notes "Files of chart set $tag."
+            (cd out/assets && xargs -a "../../$list" -n 50 gh release upload "$rel" --clobber)
+            gh release edit "$rel" --draft=false --latest=false
+          done
+          gh release create "$tag" --draft --title "$tag" --notes "$notes"
+          if [ -e "out/upload-$tag.txt" ]; then
+            (cd out/assets && xargs -a "../upload-$tag.txt" -n 50 gh release upload "$tag" --clobber)
+          fi
+          gh release upload "$tag" out/set.tsv --clobber
+          gh release edit "$tag" --draft=false --latest
